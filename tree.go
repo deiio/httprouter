@@ -3,22 +3,12 @@
 
 package httprouter
 
-import "errors"
-
 func min(a, b int) int {
 	if a <= b {
 		return a
 	}
 	return b
 }
-
-var (
-	ErrDuplicatePath     = errors.New("a Handle is already registered for this method at this path")
-	ErrEmptyWildcardName = errors.New("wildcards must be named with a non-empty name")
-	ErrCatchAllConflict  = errors.New("CatchAlls are only allowed at the end of the path")
-	ErrChildConflict     = errors.New("can't insert a wildcard route because this path has existing children")
-	ErrWildcardConflict  = errors.New("conflict with wildcard route")
-)
 
 type node struct {
 	path       string
@@ -32,9 +22,10 @@ type node struct {
 
 // addRoute adds a leaf with the given handle to the path.
 // Attention! Not concurrency-safe!
-func (n *node) addRoute(method, path string, handle Handle) error {
-	if len(n.path) == 0 {
-		return n.insertChild(method, path, handle)
+func (n *node) addRoute(method, path string, handle Handle) {
+	if len(n.path) == 0 && len(n.children) == 0 {
+		n.insertChild(method, path, handle)
+		return
 	}
 
 	for {
@@ -69,28 +60,28 @@ func (n *node) addRoute(method, path string, handle Handle) error {
 				// Check if the wildcard matches.
 				if len(path) >= len(n.path) && n.path == path[:len(n.path)] {
 					// Check for longer wildcard, e.g. :name and :namex
-					if len(n.path) < len(path) && path[len(n.path)] != '/' {
-						return ErrWildcardConflict
+					if len(n.path) >= len(path) || path[len(n.path)] == '/' {
+						n.addRoute(method, path, handle)
+						return
 					}
-					return n.addRoute(method, path, handle)
-				} else {
-					return ErrWildcardConflict
 				}
+				panic("conflict with wildcard route")
 			}
 
 			c := path[0]
 
-			// TODO: allow variable delimiter.
 			if n.isParam && c == '/' && len(n.children) == 1 {
 				n = n.children[0]
-				return n.addRoute(method, path, handle)
+				n.addRoute(method, path, handle)
+				return
 			}
 
 			// Check if a child with the next path byte exists.
 			for i, index := range n.indices {
 				if c == index {
 					n = n.children[i]
-					return n.addRoute(method, path, handle)
+					n.addRoute(method, path, handle)
+					return
 				}
 			}
 
@@ -102,24 +93,26 @@ func (n *node) addRoute(method, path string, handle Handle) error {
 				n = child
 			}
 
-			return n.insertChild(method, path, handle)
+			n.insertChild(method, path, handle)
+			return
 		} else if i == len(path) {
+			// Make node a (in-path) leaf.
 			if n.handle == nil {
 				n.handle = map[string]Handle{
 					method: handle,
 				}
 			} else {
 				if n.handle[method] != nil {
-					return ErrDuplicatePath
+					panic("a Handle is already registered for this method at this path")
 				}
 				n.handle[method] = handle
 			}
 		}
-		return nil
+		return
 	}
 }
 
-func (n *node) insertChild(method, path string, handle Handle) error {
+func (n *node) insertChild(method, path string, handle Handle) {
 	var offset int
 
 	// Find prefix until first wildcard (beginning with ':' or '*')
@@ -128,7 +121,7 @@ func (n *node) insertChild(method, path string, handle Handle) error {
 			// Check if this node existing children which would be
 			// unreachable if we insert the wildcard here
 			if len(n.children) > 0 {
-				return ErrChildConflict
+				panic("wildcard route conflicts with existing children")
 			}
 
 			// Find wildcard end (either '/' or path end)
@@ -138,39 +131,68 @@ func (n *node) insertChild(method, path string, handle Handle) error {
 			}
 
 			if k-i == 1 {
-				return ErrEmptyWildcardName
+				panic("wildcards must be named with a non-empty name")
 			}
 
-			if b == '*' && len(path) != k {
-				return ErrCatchAllConflict
-			}
-
-			// Split path at the beginning of the wildcard
-			child := &node{}
 			if b == ':' {
-				child.isParam = true
-			} else {
-				child.isCatchAll = true
-			}
+				// isParam.
+				// Split path at the beginning of the wildcard
+				if i > 0 {
+					n.path = path[offset:i]
+					offset = i
+				}
 
-			if i > 0 {
-				n.path = path[offset:i]
-				offset = i
-			}
+				child := &node{
+					isParam: true,
+				}
 
-			n.children = []*node{child}
-			n.wildChild = true
-			n = child
-
-			// If the path doesn't end with the wildcard, then there will be
-			// another non-wildcard subpath starting with '/'
-			if k < j {
-				n.path = path[offset:k]
-				offset = k
-
-				child := &node{}
 				n.children = []*node{child}
+				n.wildChild = true
 				n = child
+
+				// If the path doesn't end with the wildcard, then there will be
+				// another non-wildcard subpath starting with '/'
+				if k < j {
+					n.path = path[offset:k]
+					offset = k
+
+					child := &node{}
+					n.children = []*node{child}
+					n = child
+				}
+			} else {
+				// CatchAll/
+				if len(path) != k {
+					panic("catchAlls are only allowed at the end of the path")
+				}
+
+				// Currently fixed width 1 for '/'.
+				i--
+				if path[i] != '/' {
+					panic("no / before catchAll")
+				}
+
+				n.path = path[offset:i]
+
+				// First node: catchAll node with empty path.
+				child := &node{
+					isCatchAll: true,
+					wildChild:  true,
+				}
+				n.children = []*node{child}
+				n.indices = []byte{path[i]}
+				n = child
+
+				// Second node: node holding the variable.
+				child = &node{
+					path: path[i:],
+					handle: map[string]Handle{
+						method: handle,
+					},
+					isCatchAll: true,
+				}
+				n.children = []*node{child}
+				return
 			}
 		}
 	}
@@ -180,8 +202,6 @@ func (n *node) insertChild(method, path string, handle Handle) error {
 	n.handle = map[string]Handle{
 		method: handle,
 	}
-
-	return nil
 }
 
 // getValue returns the handle registered with the given path(path). The values of
@@ -190,6 +210,11 @@ func (n *node) insertChild(method, path string, handle Handle) error {
 // made if a handle exists with an extra (without the) trailing slash for the
 // given path.
 func (n *node) getValue(method, path string) (handle Handle, vars map[string]string, tsr bool) {
+	return n.getValueWithVars(method, path, nil)
+}
+
+func (n *node) getValueWithVars(method, path string, v map[string]string) (handle Handle, vars map[string]string, tsr bool) {
+	vars = v
 	// Walk the tree.
 	for len(path) >= len(n.path) && path[:len(n.path)] == n.path {
 		path = path[len(n.path):]
@@ -200,11 +225,12 @@ func (n *node) getValue(method, path string) (handle Handle, vars map[string]str
 			}
 
 			// No handle found. Check if a handle for this path + a
-			// trailing slash exist for TSR recommendation.
+			// trailing slash exist for trailing slash recommendation.
 			for i, index := range n.indices {
 				if index == '/' {
 					n = n.children[i]
-					tsr = n.path == "/" && n.handle != nil
+					tsr = n.path == "/" && n.handle != nil ||
+						n.isCatchAll && n.children[0].handle[method] != nil
 					return
 				}
 			}
@@ -221,8 +247,7 @@ func (n *node) getValue(method, path string) (handle Handle, vars map[string]str
 			if n.isParam {
 				// Find param end (either '/' or path end).
 				k := 0
-				l := len(path)
-				for k < l && path[k] != '/' {
+				for k < len(path) && path[k] != '/' {
 					k++
 				}
 
@@ -236,13 +261,13 @@ func (n *node) getValue(method, path string) (handle Handle, vars map[string]str
 				}
 
 				// We need to go deeper.
-				if k < l {
+				if k < len(path) {
 					if len(n.children) > 0 {
 						path = path[k:]
 						n = n.children[0]
 						continue
 					} else {
-						tsr = (l == k+1)
+						tsr = len(path) == k+1
 						return
 					}
 				}
@@ -266,10 +291,10 @@ func (n *node) getValue(method, path string) (handle Handle, vars map[string]str
 			// Save CatchAll value
 			if vars == nil {
 				vars = map[string]string{
-					n.path[1:]: path,
+					n.path[2:]: path,
 				}
 			} else {
-				vars[n.path[1:]] = path
+				vars[n.path[2:]] = path
 			}
 
 			handle = n.handle[method]
@@ -281,7 +306,7 @@ func (n *node) getValue(method, path string) (handle Handle, vars map[string]str
 		for i, index := range n.indices {
 			if c == index {
 				n = n.children[i]
-				return n.getValue(method, path)
+				return n.getValueWithVars(method, path, vars)
 			}
 		}
 
@@ -291,8 +316,8 @@ func (n *node) getValue(method, path string) (handle Handle, vars map[string]str
 		return
 	}
 
-	// Nothing found. We can recommend to redirect to the same URL with an extra
-	// trailing slash if a leaf exists for that path.
+	// Nothing found. We can recommend to redirect to the same URL
+	// without trailing slash if a leaf exists for that path.
 	tsr = (len(path)+1 == len(n.path) && n.path[len(path)] == '/' && n.handle != nil) || (path == "/")
 	return
 }

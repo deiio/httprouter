@@ -11,14 +11,18 @@ import (
 var cleanTests = []struct {
 	path, result string
 }{
-	// Already clean
+	// Already clean.
+	{"/", "/"},
+	{"/abc", "/abc"},
+	{"/a/b/c", "/a/b/c"},
+	{"/abc/", "/abc/"},
+	{"/a/b/c/", "/a/b/c/"},
+
+	// Missing root.
 	{"", "/"},
 	{"abc", "/abc"},
 	{"abc/def", "/abc/def"},
 	{"a/b/c", "/a/b/c"},
-	{"/", "/"},
-	{"../..", "/"},
-	{"../../abc", "/abc"},
 
 	// Remove doubled slash.
 	{"//", "/"},
@@ -41,6 +45,8 @@ var cleanTests = []struct {
 	{"..", "/"},
 	{"../", "/"},
 	{"../../", "/"},
+	{"../..", "/"},
+	{"../../abc", "/abc"},
 	{"/abc/def/ghi/../jkl", "/abc/def/jkl"},
 	{"/abc/def/../ghi/../jkl", "/abc/jkl"},
 	{"/abc/def/..", "/abc"},
