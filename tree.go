@@ -10,17 +10,36 @@ func min(a, b int) int {
 	return b
 }
 
+type nodeType uint8
+
+const (
+	static nodeType = iota
+	param
+	catchAll
+)
+
 type node struct {
-	path       string
-	indices    []byte
-	children   []*node
-	handle     map[string]Handle
-	wildChild  bool
-	isParam    bool
-	isCatchAll bool
+	path      string
+	indices   []byte
+	children  []*node
+	wildChild bool
+	nType     nodeType
+	handle    map[string]Handle
+	priority  uint32
 }
 
-// addRoute adds a leaf with the given handle to the path.
+func (n *node) incrementChildPrio(i int) int {
+	prio := n.children[i].priority + 1
+	// Adjust position (move to front).
+	for j := i - 1; j >= 0 && n.children[j].priority < prio; j-- {
+		n.children[i], n.children[j] = n.children[j], n.children[i]
+		n.indices[i], n.indices[j] = n.indices[j], n.indices[i]
+		i--
+	}
+	return i
+}
+
+// addRoute adds a node with the given handle to the path.
 // Attention! Not concurrency-safe!
 func (n *node) addRoute(method, path string, handle Handle) {
 	if len(n.path) == 0 && len(n.children) == 0 {
@@ -44,6 +63,7 @@ func (n *node) addRoute(method, path string, handle Handle) {
 				children:  n.children,
 				handle:    n.handle,
 				wildChild: n.wildChild,
+				priority:  n.priority,
 			}}
 			n.indices = []byte{n.path[i]}
 			n.path = path[:i]
@@ -51,11 +71,13 @@ func (n *node) addRoute(method, path string, handle Handle) {
 			n.wildChild = false
 		}
 
-		// Make new Node a child of this node
+		// Make new node a child of this node
 		if i < len(path) {
 			path = path[i:]
 
 			if n.wildChild {
+				n.priority++
+
 				n = n.children[0]
 				// Check if the wildcard matches.
 				if len(path) >= len(n.path) && n.path == path[:len(n.path)] {
@@ -70,7 +92,8 @@ func (n *node) addRoute(method, path string, handle Handle) {
 
 			c := path[0]
 
-			if n.isParam && c == '/' && len(n.children) == 1 {
+			if n.nType == param && c == '/' && len(n.children) == 1 {
+				n.priority++
 				n = n.children[0]
 				n.addRoute(method, path, handle)
 				return
@@ -79,17 +102,22 @@ func (n *node) addRoute(method, path string, handle Handle) {
 			// Check if a child with the next path byte exists.
 			for i, index := range n.indices {
 				if c == index {
+					i = n.incrementChildPrio(i)
+					n.priority++
 					n = n.children[i]
 					n.addRoute(method, path, handle)
 					return
 				}
 			}
 
+			// Otherwise insert it.
 			if c != ':' && c != '*' {
 				n.indices = append(n.indices, c)
 				child := &node{}
 				n.children = append(n.children, child)
 
+				n.incrementChildPrio(len(n.indices) - 1)
+				n.priority++
 				n = child
 			}
 
@@ -101,11 +129,13 @@ func (n *node) addRoute(method, path string, handle Handle) {
 				n.handle = map[string]Handle{
 					method: handle,
 				}
+				n.priority++
 			} else {
 				if n.handle[method] != nil {
 					panic("a Handle is already registered for this method at this path")
 				}
 				n.handle[method] = handle
+				n.priority++
 			}
 		}
 		return
@@ -143,11 +173,13 @@ func (n *node) insertChild(method, path string, handle Handle) {
 				}
 
 				child := &node{
-					isParam: true,
+					nType: param,
 				}
 
 				n.children = []*node{child}
 				n.wildChild = true
+				n.priority++
+
 				n = child
 
 				// If the path doesn't end with the wildcard, then there will be
@@ -158,6 +190,8 @@ func (n *node) insertChild(method, path string, handle Handle) {
 
 					child := &node{}
 					n.children = []*node{child}
+					n.priority++
+
 					n = child
 				}
 			} else {
@@ -176,11 +210,13 @@ func (n *node) insertChild(method, path string, handle Handle) {
 
 				// First node: catchAll node with empty path.
 				child := &node{
-					isCatchAll: true,
-					wildChild:  true,
+					wildChild: true,
+					nType:     catchAll,
 				}
 				n.children = []*node{child}
 				n.indices = []byte{path[i]}
+				n.priority++
+
 				n = child
 
 				// Second node: node holding the variable.
@@ -189,9 +225,11 @@ func (n *node) insertChild(method, path string, handle Handle) {
 					handle: map[string]Handle{
 						method: handle,
 					},
-					isCatchAll: true,
+					nType:    catchAll,
+					priority: 1,
 				}
 				n.children = []*node{child}
+				n.priority++
 				return
 			}
 		}
@@ -202,6 +240,7 @@ func (n *node) insertChild(method, path string, handle Handle) {
 	n.handle = map[string]Handle{
 		method: handle,
 	}
+	n.priority++
 }
 
 // getValue returns the handle registered with the given path(path). The values of
@@ -230,7 +269,7 @@ func (n *node) getValueWithVars(method, path string, v map[string]string) (handl
 				if index == '/' {
 					n = n.children[i]
 					tsr = n.path == "/" && n.handle != nil ||
-						n.isCatchAll && n.children[0].handle[method] != nil
+						n.nType == catchAll && n.children[0].handle[method] != nil
 					return
 				}
 			}
@@ -244,7 +283,8 @@ func (n *node) getValueWithVars(method, path string, v map[string]string) (handl
 		if n.wildChild {
 			n = n.children[0]
 
-			if n.isParam {
+			switch n.nType {
+			case param:
 				// Find param end (either '/' or path end).
 				k := 0
 				for k < len(path) && path[k] != '/' {
@@ -285,20 +325,24 @@ func (n *node) getValueWithVars(method, path string, v map[string]string) (handl
 				// Return available methods.
 
 				return
-			}
+			case catchAll:
 
-			// Catch all
-			// Save CatchAll value
-			if vars == nil {
-				vars = map[string]string{
-					n.path[2:]: path,
+				// Catch all
+				// Save CatchAll value
+				if vars == nil {
+					vars = map[string]string{
+						n.path[2:]: path,
+					}
+				} else {
+					vars[n.path[2:]] = path
 				}
-			} else {
-				vars[n.path[2:]] = path
-			}
 
-			handle = n.handle[method]
-			return
+				handle = n.handle[method]
+				return
+
+			default:
+				panic("unknown node type")
+			}
 		}
 
 		c := path[0]
